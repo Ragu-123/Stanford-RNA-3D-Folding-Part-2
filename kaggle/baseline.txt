@@ -1,0 +1,413 @@
+# %% [code] {"execution":{"iopub.status.busy":"2026-02-01T07:09:56.53566Z","iopub.execute_input":"2026-02-01T07:09:56.536216Z","iopub.status.idle":"2026-02-01T07:10:01.884273Z","shell.execute_reply.started":"2026-02-01T07:09:56.536188Z","shell.execute_reply":"2026-02-01T07:10:01.883411Z"}}
+!pip install --no-index /kaggle/input/biopython-cp312/biopython-1.86-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-02-01T07:10:01.886103Z","iopub.execute_input":"2026-02-01T07:10:01.886358Z","iopub.status.idle":"2026-02-01T07:12:28.114333Z","shell.execute_reply.started":"2026-02-01T07:10:01.88633Z","shell.execute_reply":"2026-02-01T07:12:28.113707Z"}}
+import pandas as pd
+import numpy as np
+import random
+import time
+import warnings
+import os, sys
+
+warnings.filterwarnings('ignore')
+
+DATA_PATH = '/kaggle/input/stanford-rna-3d-folding-2/'
+train_seqs = pd.read_csv(DATA_PATH + 'train_sequences.csv')
+test_seqs = pd.read_csv(DATA_PATH + 'test_sequences.csv')
+train_labels = pd.read_csv(DATA_PATH + 'train_labels.csv')
+
+sys.path.append(os.path.join(DATA_PATH, "extra"))
+
+# --- Robust import for Kaggle's extra/parse_fasta_py.py (it may miss typing imports) ---
+try:
+    import typing as _typing
+    import builtins as _builtins
+
+    # Make these names available during module import-time annotation evaluation
+    _builtins.Dict  = getattr(_typing, "Dict")
+    _builtins.Tuple = getattr(_typing, "Tuple")
+    _builtins.List  = getattr(_typing, "List")
+
+    from parse_fasta_py import parse_fasta as _parse_fasta_raw
+
+    # Normalize output to: {chain_id: sequence_string}
+    def parse_fasta(fasta_content: str):
+        d = _parse_fasta_raw(fasta_content)
+        out = {}
+        for k, v in d.items():
+            # some variants return (sequence, headers/lines) or similar
+            out[k] = v[0] if isinstance(v, tuple) else v
+        return out
+
+except Exception:
+    # Fallback FASTA parser: {chain_id: sequence_string}
+    def parse_fasta(fasta_content: str):
+        out = {}
+        cur = None
+        seq_parts = []
+        for line in str(fasta_content).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if cur is not None:
+                    out[cur] = "".join(seq_parts)
+                header = line[1:]
+                # First token is usually chain id in this dataset
+                cur = header.split()[0]
+                seq_parts = []
+            else:
+                seq_parts.append(line.replace(" ", ""))
+        if cur is not None:
+            out[cur] = "".join(seq_parts)
+        return out
+
+def parse_stoichiometry(stoich: str):
+    if pd.isna(stoich) or str(stoich).strip() == "":
+        return []
+    out = []
+    for part in str(stoich).split(';'):
+        ch, cnt = part.split(':')
+        out.append((ch.strip(), int(cnt)))
+    return out
+
+def get_chain_segments(row):
+    """
+    Returns list of (start,end) segments in row['sequence'] corresponding to chain copies in stoichiometry order.
+    Falls back to single segment if parsing fails.
+    """
+    seq = row['sequence']
+    stoich = row.get('stoichiometry', '')
+    all_seq = row.get('all_sequences', '')
+
+    if pd.isna(stoich) or pd.isna(all_seq) or str(stoich).strip()=="" or str(all_seq).strip()=="":
+        return [(0, len(seq))]
+
+    try:
+        chain_dict = parse_fasta(all_seq)  # dict: chain_id -> sequence
+        order = parse_stoichiometry(stoich)
+        segs = []
+        pos = 0
+        for ch, cnt in order:
+            base = chain_dict.get(ch)
+            if base is None:
+                return [(0, len(seq))]
+            for _ in range(cnt):
+                L = len(base)
+                segs.append((pos, pos + L))
+                pos += L
+        if pos != len(seq):
+            return [(0, len(seq))]
+        return segs
+    except Exception:
+        return [(0, len(seq))]
+
+def build_segments_map(df):
+    seg_map = {}
+    stoich_map = {}
+    for _, r in df.iterrows():
+        tid = r['target_id']
+        seg_map[tid] = get_chain_segments(r)
+        stoich_map[tid] = str(r.get('stoichiometry', '') if not pd.isna(r.get('stoichiometry', '')) else '')
+    return seg_map, stoich_map
+
+train_segs_map, train_stoich_map = build_segments_map(train_seqs)
+test_segs_map,  test_stoich_map  = build_segments_map(test_seqs)
+
+def process_labels(labels_df):
+    coords_dict = {}
+    # Faster + safer prefix extraction
+    prefixes = labels_df['ID'].str.rsplit('_', n=1).str[0]
+    for id_prefix, group in labels_df.groupby(prefixes):
+        coords_dict[id_prefix] = group.sort_values('resid')[['x_1', 'y_1', 'z_1']].values
+    return coords_dict
+
+train_coords_dict = process_labels(train_labels)
+
+from Bio.Align import PairwiseAligner
+
+aligner = PairwiseAligner()
+aligner.mode = 'global'
+aligner.match_score = 2
+aligner.mismatch_score = -1.5
+
+# Stronger gap penalties discourage "sliding" (critical: residue numbering must match)
+aligner.open_gap_score   = -8
+aligner.extend_gap_score = -0.4
+
+# Also penalize terminal gaps (prevents end-gap semi-global behavior)
+aligner.query_left_open_gap_score  = -8
+aligner.query_left_extend_gap_score = -0.4
+aligner.query_right_open_gap_score = -8
+aligner.query_right_extend_gap_score = -0.4
+aligner.target_left_open_gap_score = -8
+aligner.target_left_extend_gap_score = -0.4
+aligner.target_right_open_gap_score = -8
+aligner.target_right_extend_gap_score = -0.4
+
+def find_similar_sequences(query_seq, train_seqs_df, train_coords_dict, top_n=5):
+    similar_seqs = []
+    
+    # Pre-filter: Iterate only valid targets
+    # Note: aligner.score is much faster than generating full alignments
+    for _, row in train_seqs_df.iterrows():
+        target_id, train_seq = row['target_id'], row['sequence']
+        if target_id not in train_coords_dict: continue
+        
+        # Length filter (keep your original logic)
+        if abs(len(train_seq) - len(query_seq)) / max(len(train_seq), len(query_seq)) > 0.3: continue
+        
+        # FAST SCORE: Calculates score without traceback overhead
+        raw_score = aligner.score(query_seq, train_seq)
+        
+        normalized_score = raw_score / (2 * min(len(query_seq), len(train_seq)))
+        similar_seqs.append((target_id, train_seq, normalized_score, train_coords_dict[target_id]))
+    
+    similar_seqs.sort(key=lambda x: x[2], reverse=True)
+    return similar_seqs[:top_n]
+
+def adapt_template_to_query(query_seq, template_seq, template_coords):
+    # Generate the alignment object
+    # aligner.align returns an iterator; we take the first optimal alignment
+    alignment = next(iter(aligner.align(query_seq, template_seq)))
+    
+    new_coords = np.full((len(query_seq), 3), np.nan)
+    
+    # VECTORIZED MAPPING:
+    # alignment.aligned returns lists of (start, end) tuples for matched segments.
+    # This avoids the slow python loop "for char_q, char_t in zip..."
+    for (q_start, q_end), (t_start, t_end) in zip(*alignment.aligned):
+        # Map the coordinate chunk directly
+        t_chunk = template_coords[t_start:t_end]
+        
+        # Safety check to ensure shapes match (handles edge cases)
+        if len(t_chunk) == (q_end - q_start):
+            new_coords[q_start:q_end] = t_chunk
+
+    # --- Interpolation Logic (Unchanged) ---
+    for i in range(len(new_coords)):
+        if np.isnan(new_coords[i, 0]):
+            prev_v = next((j for j in range(i-1, -1, -1) if not np.isnan(new_coords[j, 0])), -1)
+            next_v = next((j for j in range(i+1, len(new_coords)) if not np.isnan(new_coords[j, 0])), -1)
+            if prev_v >= 0 and next_v >= 0:
+                w = (i - prev_v) / (next_v - prev_v)
+                new_coords[i] = (1-w)*new_coords[prev_v] + w*new_coords[next_v]
+            elif prev_v >= 0: new_coords[i] = new_coords[prev_v] + [3, 0, 0]
+            elif next_v >= 0: new_coords[i] = new_coords[next_v] + [3, 0, 0]
+            else: new_coords[i] = [i*3, 0, 0]
+            
+    return np.nan_to_num(new_coords)
+
+def adaptive_rna_constraints(coordinates, target_id, confidence=1.0, passes=2):
+    """
+    Evaluation-driven constraints:
+    - US-align is show-only rigid body => internal geometry errors are fatal
+    - apply within each chain segment (no fake bond across chain breaks)
+    """
+    coords = coordinates.copy()
+    segments = test_segs_map.get(target_id, [(0, len(coords))])
+
+    # stronger corrections when confidence is low
+    strength = 0.75 * (1.0 - min(confidence, 0.97))
+    strength = max(strength, 0.02)
+
+    for _ in range(passes):
+        for (s, e) in segments:
+            X = coords[s:e]
+            L = e - s
+            if L < 3:
+                coords[s:e] = X
+                continue
+
+            # (1) bond i,i+1 to ~5.95Å (vectorized, symmetric)
+            d = X[1:] - X[:-1]
+            dist = np.linalg.norm(d, axis=1) + 1e-6
+            target = 5.95
+            scale = (target - dist) / dist
+            adj = (d * scale[:, None]) * (0.22 * strength)
+            X[:-1] -= adj
+            X[1:]  += adj
+
+            # (2) soft i,i+2 to ~10.2Å (vectorized, symmetric)
+            d2 = X[2:] - X[:-2]
+            dist2 = np.linalg.norm(d2, axis=1) + 1e-6
+            target2 = 10.2
+            scale2 = (target2 - dist2) / dist2
+            adj2 = (d2 * scale2[:, None]) * (0.10 * strength)
+            X[:-2] -= adj2
+            X[2:]  += adj2
+
+            # (3) Laplacian smoothing (removes kinks US-align cannot fix)
+            lap = 0.5 * (X[:-2] + X[2:]) - X[1:-1]
+            X[1:-1] += (0.06 * strength) * lap
+
+            # (4) light self-avoidance (prevents steric collapse)
+            if L >= 25:
+                k = min(L, 160) if L > 220 else L
+                if k < L:
+                    idx = np.linspace(0, L - 1, k).astype(int)
+                else:
+                    idx = np.arange(L)
+
+                P = X[idx]
+                diff = P[:, None, :] - P[None, :, :]
+                distm = np.linalg.norm(diff, axis=2) + 1e-6
+                sep = np.abs(idx[:, None] - idx[None, :])
+
+                mask = (sep > 2) & (distm < 3.2)
+                if np.any(mask):
+                    force = (3.2 - distm) / distm
+                    vec = (diff * force[:, :, None] * mask[:, :, None]).sum(axis=1)
+                    X[idx] += (0.015 * strength) * vec
+
+            coords[s:e] = X
+
+    return coords
+
+def _rotmat(axis, ang):
+    axis = np.asarray(axis, float)
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    x, y, z = axis
+    c, s = np.cos(ang), np.sin(ang)
+    C = 1.0 - c
+    return np.array([
+        [c + x*x*C,     x*y*C - z*s, x*z*C + y*s],
+        [y*x*C + z*s,   c + y*y*C,   y*z*C - x*s],
+        [z*x*C - y*s,   z*y*C + x*s, c + z*z*C]
+    ], dtype=float)
+
+def apply_hinge(coords, seg, rng, max_angle_deg=25):
+    s, e = seg
+    L = e - s
+    if L < 30:
+        return coords
+    pivot = s + int(rng.integers(10, L - 10))
+    axis = rng.normal(size=3)
+    ang = np.deg2rad(float(rng.uniform(-max_angle_deg, max_angle_deg)))
+    R = _rotmat(axis, ang)
+    X = coords.copy()
+    p0 = X[pivot].copy()
+    X[pivot+1:e] = (X[pivot+1:e] - p0) @ R.T + p0
+    return X
+
+def jitter_chains(coords, segments, rng, max_angle_deg=12, max_trans=1.5):
+    X = coords.copy()
+    global_center = X.mean(axis=0, keepdims=True)
+    for (s, e) in segments:
+        axis = rng.normal(size=3)
+        ang = np.deg2rad(float(rng.uniform(-max_angle_deg, max_angle_deg)))
+        R = _rotmat(axis, ang)
+        shift = rng.normal(size=3)
+        shift = shift / (np.linalg.norm(shift) + 1e-12) * float(rng.uniform(0.0, max_trans))
+        c = X[s:e].mean(axis=0, keepdims=True)
+        X[s:e] = (X[s:e] - c) @ R.T + c + shift
+    # recenter
+    X -= X.mean(axis=0, keepdims=True) - global_center
+    return X
+
+def smooth_wiggle(coords, segments, rng, amp=0.8):
+    X = coords.copy()
+    for (s, e) in segments:
+        L = e - s
+        if L < 20:
+            continue
+        n_ctrl = 6
+        ctrl_x = np.linspace(0, L - 1, n_ctrl)
+        ctrl_disp = rng.normal(0, amp, size=(n_ctrl, 3))
+        t = np.arange(L)
+        disp = np.vstack([np.interp(t, ctrl_x, ctrl_disp[:, k]) for k in range(3)]).T
+        X[s:e] += disp
+    return X
+
+def predict_rna_structures(row, train_seqs_df, train_coords_dict, n_predictions=6):
+    tid = row['target_id']
+    seq = row['sequence']
+
+    # Data constraint: should already be canonical A/C/G/U
+    assert set(seq).issubset(set("ACGU")), f"Non-ACGU in {tid}; do not remap here."
+
+    segments = test_segs_map.get(tid, [(0, len(seq))])
+
+    # Grab a larger candidate pool, then sample for diversity (best-of-5)
+    cands = find_similar_sequences(query_seq=seq, train_seqs_df=train_seqs_df, train_coords_dict=train_coords_dict, top_n=30)
+    assert all(len(c[3]) == len(c[1]) for c in cands), "Template coords/seq length mismatch"
+    predictions = []
+    used = set()
+
+    for i in range(n_predictions):
+        seed = (abs(hash(tid)) + i * 10007) % (2**32)
+        rng = np.random.default_rng(seed)
+
+        if not cands:
+            # hard fallback (straight line per chain)
+            coords = np.zeros((len(seq), 3), dtype=float)
+            for (s, e) in segments:
+                for j in range(s+1, e):
+                    coords[j] = coords[j-1] + [5.95, 0, 0]
+            predictions.append(coords)
+            continue
+
+        # Choose template:
+        # i=0 => best template; others => sample among top-K with weights, avoid duplicates
+        if i == 0:
+            t_id, t_seq, sim, t_coords = cands[0]
+        else:
+            K = min(12, len(cands))
+            sims = np.array([cands[k][2] for k in range(K)], float)
+            w = np.exp((sims - sims.max()) / 0.08)
+            # penalize already used templates
+            for k in range(K):
+                if cands[k][0] in used:
+                    w[k] *= 0.10
+            w = w / (w.sum() + 1e-12)
+            k = int(rng.choice(np.arange(K), p=w))
+            t_id, t_seq, sim, t_coords = cands[k]
+
+        used.add(t_id)
+
+        # Transfer coords with diagonal-guard mapping (no sliding)
+        adapted = adapt_template_to_query(query_seq=seq, template_seq=t_seq, template_coords=t_coords)
+
+        # Diversity transforms (then re-refine constraints)
+        if i == 0:
+            X = adapted
+        elif i == 1:
+            # mild noise
+            X = adapted + rng.normal(0, max(0.01, (0.40 - sim) * 0.06), adapted.shape)
+        elif i == 2:
+            # hinge within the longest chain
+            longest = max(segments, key=lambda se: se[1] - se[0])
+            X = apply_hinge(adapted, longest, rng, max_angle_deg=22)
+        elif i == 3:
+            # inter-chain jitter (small, safe)
+            X = jitter_chains(adapted, segments, rng, max_angle_deg=10, max_trans=1.0)
+        else:
+            # smooth low-frequency deformation
+            X = smooth_wiggle(adapted, segments, rng, amp=0.7)
+
+        refined = adaptive_rna_constraints(X, tid, confidence=sim, passes=2)
+        predictions.append(refined)
+
+    return predictions
+
+all_predictions = []
+start_time = time.time()
+for idx, row in test_seqs.iterrows():
+    if idx % 10 == 0: print(f"Processing {idx} | {time.time()-start_time:.1f}s")
+    tid, seq = row['target_id'], row['sequence']
+    preds = predict_rna_structures(row, train_seqs, train_coords_dict)
+    for j in range(len(seq)):
+        res = {'ID': f"{tid}_{j+1}", 'resname': seq[j], 'resid': j+1}
+        for i in range(5):
+            res[f'x_{i+1}'], res[f'y_{i+1}'], res[f'z_{i+1}'] = preds[i][j]
+        all_predictions.append(res)
+
+sub = pd.DataFrame(all_predictions)
+cols = ['ID', 'resname', 'resid'] + [f'{c}_{i}' for i in range(1,6) for c in ['x','y','z']]
+
+# Safety: competition clips coords; do it explicitly to avoid out-of-range explosions
+coord_cols = [c for c in cols if c.startswith(('x_','y_','z_'))]
+sub[coord_cols] = sub[coord_cols].clip(-999.999, 9999.999)
+
+sub[cols].to_csv('submission.csv', index=False)
+print("submission.csv! saved")
