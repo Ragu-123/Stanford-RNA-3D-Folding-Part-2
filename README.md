@@ -21,3 +21,14 @@ When `USE_GPU = True`, the notebook uses CuPy (or PyTorch if available) to batch
 - **0 targets**: ~1.0x (no meaningful gain; GPU setup overhead dominates).
 - **10 targets**: ~1.5–2.5x faster coarse filtering and end-to-end runtime.
 - **20 targets**: ~2–4x faster coarse filtering and end-to-end runtime.
+
+## Runtime breakdown
+The baseline now prints a runtime summary every 10 targets with per-target averages for:
+- MSA/profile preparation
+- Candidate filtering
+- Alignment scoring
+- Coordinate adaptation
+- Constraints refinement
+- I/O (submission write + validation read)
+
+At the end, it reports the average time/target and estimated runtime for 0/10/20 targets derived from those averages. This makes it easy to sanity-check overall throughput and identify hot spots when tuning parameters or switching between CPU/GPU coarse filtering.

@@ -13,6 +13,32 @@ import importlib.util
 
 warnings.filterwarnings('ignore')
 
+TIMING_CONTEXT = None
+
+class Timer:
+    def __init__(self, key, timings=None):
+        self.key = key
+        self.timings = timings
+        self.start = None
+
+    def __enter__(self):
+        self.start = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.timings is None:
+            return False
+        elapsed = time.time() - self.start
+        self.timings[self.key] = self.timings.get(self.key, 0.0) + elapsed
+        return False
+
+def set_timing_context(timings):
+    global TIMING_CONTEXT
+    TIMING_CONTEXT = timings
+
+def _time_block(key):
+    return Timer(key, TIMING_CONTEXT)
+
 DATA_PATH = '/kaggle/input/stanford-rna-3d-folding-2/'
 MSA_PATH = os.path.join(DATA_PATH, "MSA")
 RUN_VALIDATION_EVAL = True
@@ -324,8 +350,9 @@ msa_cache = {}
 def _get_msa_profile(target_id):
     if target_id in msa_cache:
         return msa_cache[target_id]
-    path = os.path.join(MSA_PATH, f"{target_id}.MSA.fasta")
-    prof = _msa_profile_from_fasta(path)
+    with _time_block("msa_profile_prep"):
+        path = os.path.join(MSA_PATH, f"{target_id}.MSA.fasta")
+        prof = _msa_profile_from_fasta(path)
     msa_cache[target_id] = prof
     return prof
 
@@ -350,13 +377,14 @@ def find_similar_sequences(query_seq, query_id, train_seqs_df, train_coords_dict
     similar_seqs = []
     query_segments = test_segs_map.get(query_id, [(0, len(query_seq))])
     query_prof = _get_msa_profile(query_id)
-    kmer_sims, embed_sims = _batch_kmer_embedding_sims(query_seq)
-    len_diff = np.abs(train_lengths - len(query_seq)) / np.maximum(train_lengths, len(query_seq))
-    coarse_scores = 0.7 * kmer_sims + 0.3 * embed_sims
-    valid_mask = (len_diff <= 0.3) & (coarse_scores >= 0.05)
-    candidate_indices = np.where(valid_mask)[0]
-    if candidate_indices.size:
-        candidate_indices = candidate_indices[np.argsort(coarse_scores[candidate_indices])[::-1]]
+    with _time_block("candidate_filtering"):
+        kmer_sims, embed_sims = _batch_kmer_embedding_sims(query_seq)
+        len_diff = np.abs(train_lengths - len(query_seq)) / np.maximum(train_lengths, len(query_seq))
+        coarse_scores = 0.7 * kmer_sims + 0.3 * embed_sims
+        valid_mask = (len_diff <= 0.3) & (coarse_scores >= 0.05)
+        candidate_indices = np.where(valid_mask)[0]
+        if candidate_indices.size:
+            candidate_indices = candidate_indices[np.argsort(coarse_scores[candidate_indices])[::-1]]
 
     for idx in candidate_indices:
         target_id = train_target_ids[idx]
@@ -366,10 +394,10 @@ def find_similar_sequences(query_seq, query_id, train_seqs_df, train_coords_dict
         kmer_sim = float(kmer_sims[idx])
 
         template_segments = train_segs_map.get(target_id, [(0, len(train_seq))])
-        align_sim = _alignment_score_chainaware(query_seq, train_seq, query_segments, template_segments)
-
-        template_prof = _get_msa_profile(target_id)
-        msa_sim = _profile_similarity(query_seq, train_seq, query_prof, template_prof)
+        with _time_block("alignment_scoring"):
+            align_sim = _alignment_score_chainaware(query_seq, train_seq, query_segments, template_segments)
+            template_prof = _get_msa_profile(target_id)
+            msa_sim = _profile_similarity(query_seq, train_seq, query_prof, template_prof)
 
         fused = 0.65 * align_sim + 0.20 * kmer_sim + 0.15 * msa_sim
         similar_seqs.append((target_id, train_seq, fused, train_coords_dict[target_id]))
@@ -583,13 +611,14 @@ def predict_rna_structures(row, train_seqs_df, train_coords_dict, n_predictions=
         used.add(t_id)
 
         template_segments = train_segs_map.get(t_id, [(0, len(t_seq))])
-        adapted = adapt_template_to_query(
-            query_seq=seq,
-            template_seq=t_seq,
-            template_coords=t_coords,
-            query_segments=segments,
-            template_segments=template_segments,
-        )
+        with _time_block("coordinate_adaptation"):
+            adapted = adapt_template_to_query(
+                query_seq=seq,
+                template_seq=t_seq,
+                template_coords=t_coords,
+                query_segments=segments,
+                template_segments=template_segments,
+            )
 
         # Diversity transforms (then re-refine constraints)
         if i == 0:
@@ -608,7 +637,8 @@ def predict_rna_structures(row, train_seqs_df, train_coords_dict, n_predictions=
             # smooth low-frequency deformation
             X = smooth_wiggle(adapted, segments, rng, amp=0.7)
 
-        refined = adaptive_rna_constraints(X, tid, confidence=sim, passes=2)
+        with _time_block("constraints_refinement"):
+            refined = adaptive_rna_constraints(X, tid, confidence=sim, passes=2)
         predictions.append(refined)
 
     return predictions
@@ -665,13 +695,37 @@ def evaluate_on_validation(predictions_by_target, labels_df):
         scores.append(max(best_preds))
     return float(np.mean(scores)) if scores else 0.0
 
+def _format_seconds(seconds):
+    return f"{seconds:.2f}s"
+
+def _print_timing_summary(timing_totals, targets_processed):
+    avg_total = timing_totals.get("total", 0.0) / max(targets_processed, 1)
+    print(f"Timing summary after {targets_processed} targets:")
+    print(f"  Avg time/target: {_format_seconds(avg_total)}")
+    for key, label in [
+        ("msa_profile_prep", "MSA/profile prep"),
+        ("candidate_filtering", "Candidate filtering"),
+        ("alignment_scoring", "Alignment scoring"),
+        ("coordinate_adaptation", "Coordinate adaptation"),
+        ("constraints_refinement", "Constraints refinement"),
+        ("io", "I/O"),
+    ]:
+        avg = timing_totals.get(key, 0.0) / max(targets_processed, 1)
+        print(f"  {label}: {_format_seconds(avg)}")
+    print("-" * 40)
+
 all_predictions = []
 predictions_by_target = {}
 start_time = time.time()
+timing_totals = {}
+targets_processed = 0
 for idx, row in test_seqs.iterrows():
     if idx % 10 == 0:
         print(f"Processing {idx} | {time.time() - start_time:.1f}s")
     tid, seq = row['target_id'], row['sequence']
+    target_timings = {}
+    set_timing_context(target_timings)
+    target_start = time.time()
     preds = predict_rna_structures(row, train_seqs, train_coords_dict)
     predictions_by_target[tid] = preds[:5]
     for j in range(len(seq)):
@@ -679,6 +733,13 @@ for idx, row in test_seqs.iterrows():
         for i in range(5):
             res[f'x_{i + 1}'], res[f'y_{i + 1}'], res[f'z_{i + 1}'] = preds[i][j]
         all_predictions.append(res)
+    target_timings["total"] = time.time() - target_start
+    set_timing_context(None)
+    targets_processed += 1
+    for key, value in target_timings.items():
+        timing_totals[key] = timing_totals.get(key, 0.0) + value
+    if targets_processed % 10 == 0:
+        _print_timing_summary(timing_totals, targets_processed)
 
 sub = pd.DataFrame(all_predictions)
 cols = ['ID', 'resname', 'resid'] + [f'{c}_{i}' for i in range(1, 6) for c in ['x', 'y', 'z']]
@@ -686,14 +747,22 @@ cols = ['ID', 'resname', 'resid'] + [f'{c}_{i}' for i in range(1, 6) for c in ['
 coord_cols = [c for c in cols if c.startswith(('x_', 'y_', 'z_'))]
 sub[coord_cols] = sub[coord_cols].clip(-999.999, 9999.999)
 
-sub[cols].to_csv('submission.csv', index=False)
+with Timer("io", timing_totals):
+    sub[cols].to_csv('submission.csv', index=False)
 print("submission.csv! saved")
 
 if RUN_VALIDATION_EVAL:
     val_labels_path = os.path.join(DATA_PATH, "validation_labels.csv")
     if os.path.exists(val_labels_path):
-        val_labels = pd.read_csv(val_labels_path)
+        with Timer("io", timing_totals):
+            val_labels = pd.read_csv(val_labels_path)
         val_score = evaluate_on_validation(predictions_by_target, val_labels)
         print(f"Validation TM-score (best-of-5): {val_score:.4f}")
     else:
         print("Validation labels not found; skipping local TM-score evaluation.")
+
+avg_total_time = timing_totals.get("total", 0.0) / max(targets_processed, 1)
+print("Estimated runtime based on average time/target:")
+for n_targets in (0, 10, 20):
+    estimate = avg_total_time * n_targets
+    print(f"  {n_targets} targets: {_format_seconds(estimate)}")
