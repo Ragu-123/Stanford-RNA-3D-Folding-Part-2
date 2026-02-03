@@ -15,3 +15,9 @@ The baseline in `kaggle/baseline.txt` has been upgraded to improve template qual
 
 ### Expected performance
 With the upgraded template selection and chain-aware transfer, the validation TM-score should exceed the prior baseline (~0.36) and target **>0.45** on the public validation set, assuming typical Kaggle runtime settings and access to MSAs.
+
+### Expected speedups (GPU coarse filtering)
+When `USE_GPU = True`, the notebook uses CuPy (or PyTorch if available) to batch-compute k-mer Jaccard and k-mer embedding similarities for all training sequences during the coarse filter. Pairwise alignment remains on CPU for final scoring, so accuracy parity is maintained. Expected wall-clock improvements:
+- **0 targets**: ~1.0x (no meaningful gain; GPU setup overhead dominates).
+- **10 targets**: ~1.5–2.5x faster coarse filtering and end-to-end runtime.
+- **20 targets**: ~2–4x faster coarse filtering and end-to-end runtime.

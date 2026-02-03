@@ -9,12 +9,14 @@ import time
 import warnings
 import os
 import sys
+import importlib.util
 
 warnings.filterwarnings('ignore')
 
 DATA_PATH = '/kaggle/input/stanford-rna-3d-folding-2/'
 MSA_PATH = os.path.join(DATA_PATH, "MSA")
 RUN_VALIDATION_EVAL = True
+USE_GPU = True
 train_seqs = pd.read_csv(DATA_PATH + 'train_sequences.csv')
 test_seqs = pd.read_csv(DATA_PATH + 'test_sequences.csv')
 train_labels = pd.read_csv(DATA_PATH + 'train_labels.csv')
@@ -147,19 +149,118 @@ aligner.target_left_extend_gap_score = -0.4
 aligner.target_right_open_gap_score = -8
 aligner.target_right_extend_gap_score = -0.4
 
-def _kmer_set(seq, k=4):
+KMER_K = 4
+KMER_ALPHABET = "ACGU"
+KMER_DIM = len(KMER_ALPHABET) ** KMER_K
+KMER_INDEX = {ch: i for i, ch in enumerate(KMER_ALPHABET)}
+
+def _kmer_vectors(seq, k=KMER_K):
+    counts = np.zeros(KMER_DIM, dtype=np.float32)
     if len(seq) < k:
-        return {seq}
-    return {seq[i:i + k] for i in range(len(seq) - k + 1)}
+        return counts, counts
+    rolling = []
+    for ch in seq:
+        if ch in KMER_INDEX:
+            rolling.append(KMER_INDEX[ch])
+        else:
+            rolling.append(None)
+    base = len(KMER_ALPHABET)
+    pow_base = base ** (k - 1)
+    idx = 0
+    valid = 0
+    for i, code in enumerate(rolling):
+        if code is None:
+            idx = 0
+            valid = 0
+            continue
+        if valid < k:
+            idx = idx * base + code
+            valid += 1
+            if valid == k:
+                counts[idx] += 1
+        else:
+            idx = (idx - rolling[i - k] * pow_base) * base + code
+            counts[idx] += 1
+    presence = (counts > 0).astype(np.float32)
+    total = counts.sum()
+    if total > 0:
+        counts /= total
+    return presence, counts
 
-train_kmer_cache = {row['target_id']: _kmer_set(row['sequence']) for _, row in train_seqs.iterrows()}
+train_target_ids = train_seqs['target_id'].tolist()
+train_sequences = train_seqs['sequence'].tolist()
+train_lengths = np.array([len(seq) for seq in train_sequences], dtype=np.int32)
 
-def _kmer_jaccard(qset, tset):
-    if not qset or not tset:
-        return 0.0
-    inter = len(qset & tset)
-    union = len(qset | tset)
-    return inter / max(union, 1)
+train_kmer_presence = []
+train_kmer_counts = []
+for seq in train_sequences:
+    presence_vec, count_vec = _kmer_vectors(seq)
+    train_kmer_presence.append(presence_vec)
+    train_kmer_counts.append(count_vec)
+
+train_kmer_presence = np.stack(train_kmer_presence, axis=0)
+train_kmer_counts = np.stack(train_kmer_counts, axis=0)
+train_kmer_presence_sums = train_kmer_presence.sum(axis=1)
+train_kmer_norms = np.linalg.norm(train_kmer_counts, axis=1) + 1e-8
+
+GPU_BACKEND = None
+GPU_LIB = None
+if USE_GPU:
+    if importlib.util.find_spec("cupy") is not None:
+        import cupy as cp
+        if cp.cuda.runtime.getDeviceCount() > 0:
+            GPU_BACKEND = "cupy"
+            GPU_LIB = cp
+    if GPU_BACKEND is None and importlib.util.find_spec("torch") is not None:
+        import torch
+        if torch.cuda.is_available():
+            GPU_BACKEND = "torch"
+            GPU_LIB = torch
+
+train_presence_gpu = None
+train_counts_gpu = None
+train_presence_sums_gpu = None
+train_norms_gpu = None
+if GPU_BACKEND == "cupy":
+    train_presence_gpu = GPU_LIB.asarray(train_kmer_presence)
+    train_counts_gpu = GPU_LIB.asarray(train_kmer_counts)
+    train_presence_sums_gpu = GPU_LIB.asarray(train_kmer_presence_sums)
+    train_norms_gpu = GPU_LIB.asarray(train_kmer_norms)
+elif GPU_BACKEND == "torch":
+    device = GPU_LIB.device("cuda")
+    train_presence_gpu = GPU_LIB.from_numpy(train_kmer_presence).to(device)
+    train_counts_gpu = GPU_LIB.from_numpy(train_kmer_counts).to(device)
+    train_presence_sums_gpu = GPU_LIB.from_numpy(train_kmer_presence_sums).to(device)
+    train_norms_gpu = GPU_LIB.from_numpy(train_kmer_norms).to(device)
+
+def _batch_kmer_embedding_sims(query_seq):
+    q_presence, q_counts = _kmer_vectors(query_seq)
+    q_presence_sum = q_presence.sum()
+    q_norm = np.linalg.norm(q_counts) + 1e-8
+    if GPU_BACKEND == "cupy":
+        qp = GPU_LIB.asarray(q_presence)
+        qc = GPU_LIB.asarray(q_counts)
+        inter = train_presence_gpu @ qp
+        union = train_presence_sums_gpu + q_presence_sum - inter
+        kmer_sim = inter / GPU_LIB.maximum(union, 1e-8)
+        dot = train_counts_gpu @ qc
+        embed_sim = dot / (train_norms_gpu * q_norm + 1e-8)
+        return GPU_LIB.asnumpy(kmer_sim), GPU_LIB.asnumpy(embed_sim)
+    if GPU_BACKEND == "torch":
+        qp = GPU_LIB.from_numpy(q_presence).to(train_presence_gpu.device)
+        qc = GPU_LIB.from_numpy(q_counts).to(train_counts_gpu.device)
+        inter = train_presence_gpu @ qp
+        union = train_presence_sums_gpu + q_presence_sum - inter
+        kmer_sim = inter / GPU_LIB.clamp(union, min=1e-8)
+        dot = train_counts_gpu @ qc
+        embed_sim = dot / (train_norms_gpu * q_norm + 1e-8)
+        return kmer_sim.cpu().numpy(), embed_sim.cpu().numpy()
+    inter = train_kmer_presence @ q_presence
+    union = train_kmer_presence_sums + q_presence_sum - inter
+    kmer_sim = inter / np.maximum(union, 1e-8)
+    dot = train_kmer_counts @ q_counts
+    embed_sim = dot / (train_kmer_norms * q_norm + 1e-8)
+    return kmer_sim, embed_sim
 
 def _alignment_score_chainaware(query_seq, template_seq, query_segments, template_segments):
     if len(query_segments) != len(template_segments):
@@ -247,20 +348,22 @@ def _profile_similarity(query_seq, template_seq, query_prof, template_prof):
 
 def find_similar_sequences(query_seq, query_id, train_seqs_df, train_coords_dict, top_n=5):
     similar_seqs = []
-    qset = _kmer_set(query_seq)
     query_segments = test_segs_map.get(query_id, [(0, len(query_seq))])
     query_prof = _get_msa_profile(query_id)
+    kmer_sims, embed_sims = _batch_kmer_embedding_sims(query_seq)
+    len_diff = np.abs(train_lengths - len(query_seq)) / np.maximum(train_lengths, len(query_seq))
+    coarse_scores = 0.7 * kmer_sims + 0.3 * embed_sims
+    valid_mask = (len_diff <= 0.3) & (coarse_scores >= 0.05)
+    candidate_indices = np.where(valid_mask)[0]
+    if candidate_indices.size:
+        candidate_indices = candidate_indices[np.argsort(coarse_scores[candidate_indices])[::-1]]
 
-    for _, row in train_seqs_df.iterrows():
-        target_id, train_seq = row['target_id'], row['sequence']
+    for idx in candidate_indices:
+        target_id = train_target_ids[idx]
+        train_seq = train_sequences[idx]
         if target_id not in train_coords_dict:
             continue
-        if abs(len(train_seq) - len(query_seq)) / max(len(train_seq), len(query_seq)) > 0.3:
-            continue
-
-        kmer_sim = _kmer_jaccard(qset, train_kmer_cache[target_id])
-        if kmer_sim < 0.05:
-            continue
+        kmer_sim = float(kmer_sims[idx])
 
         template_segments = train_segs_map.get(target_id, [(0, len(train_seq))])
         align_sim = _alignment_score_chainaware(query_seq, train_seq, query_segments, template_segments)
