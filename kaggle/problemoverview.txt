@@ -1,0 +1,102 @@
+Stanford RNA 3D Folding Part 2
+Solve RNA structure prediction, one of biology's remaining grand challenges
+
+
+Stanford RNA 3D Folding Part 2
+
+Join Competition
+Overview
+If you were handed only a melody and asked to compose a full symphony, you’d need to rely on patterns, structure, and musical intuition to build the rest. In the same way, predicting Ribonucleic acid (RNA)’s 3D structure means using its sequence to determine how it folds into the shapes that define its function.
+
+In this part 2 of the original Stanford RNA 3D Folding competition, help uncover how RNA molecules fold and function at the molecular level by developing machine learning models that predict the 3D structure of RNA molecules using only their sequences.
+
+Start
+
+a month ago
+Close
+2 months to go
+Merger & Entry
+Description
+RNA is essential to life’s core functions, but predicting its 3D structure remains difficult. Unlike proteins, where models like AlphaFold have made major progress, RNA modeling is still held back by limited data and the complexity of RNA folding.
+
+This is the second Stanford RNA 3D Folding Challenge. The first marked a major milestone, where fully automated models matched human experts for the first time. Now, you’ll face even more complex targets, including ones with no structural templates, and a new evaluation metric designed to reward greater accuracy.
+
+Your work could solve a key challenge in molecular biology. Better RNA structure prediction could unlock new treatments, accelerate research, and deepen our understanding of how life works. This competition runs on a roughly two-month timeline, aiming to surface new breakthroughs ahead of the 17th Critical Assessment of Structure Prediction (CASP17) in April 2026.
+
+This competition is made possible through a worldwide collaborative effort including the organizers, experimental RNA structural biologists, NVIDIA Healthcare, the AI@HHMI initiative of the Howard Hughes Medical Institute, and Stanford University School of Medicine.
+
+Evaluation
+Submissions are scored using TM-score ("template modeling" score), which goes from 0.0 to 1.0 (higher is better):
+\text{TM-score} = \max \left( \frac{1}{L_{\text{ref}}} \sum_{i=1}^{L_{\text{align}}} \frac{1}{1 + \left( \frac{d_i}{d_0} \right)^2 } \right)
+
+where:
+
+Lref is the number of residues solved in the experimental reference structure ("ground truth").
+
+Lalign is the number of aligned residues.
+
+di is the distance between the ith pair of aligned residues, in Angstroms.
+
+d0 is a distance scaling factor in Angstroms, defined as:
+d_0 = 0.6 (L_{\text{ref}} - 0.5)^{1/2}  - 2.5
+
+for Lref ≥ 30; and d0 = 0.3, 0.4, 0.5, 0.6, or 0.7 for Lref <12, 12-15, 16-19, 20-23, or 24-29, respectively.
+
+The rotation and translation of predicted structures to align with experimental reference structures are carried out by US-align. To reward high accuracy modeling, the alignment will reward only residues in the prediction that align with the reference residues with the same numbering.
+
+For each target RNA sequence, you will submit 5 predictions and your final score will be the average of best-of-5 TM-scores of all targets. For a few targets, multiple slightly different structures have been captured experimentally; your predictions' scores will be based on the best TM-score compared to each of these reference structures.
+
+The scoring metric is publicly available at this link.
+
+Submission File
+For each sequence in the test set, you can predict five structures. Your notebook should look for a file test_sequences.csv and output submission.csv. This file should contain x, y, z coordinates of the C1' atom in each residue across your predicted structures 1 to 5:
+
+ID,resname,resid,x_1,y_1,z_1,... x_5,y_5,z_5
+R1107_1,G,1,-7.561,9.392,9.361,... -7.301,9.023,8.932
+R1107_2,G,1,-8.02,11.014,14.606,... -7.953,10.02,12.127
+etc.
+You must submit five sets of coordinates.
+
+Timeline
+January 7, 2026 - Start Date.
+March 18, 2026 - Entry Deadline. You must accept the competition rules before this date in order to compete.
+March 18, 2026 - Team Merger Deadline. This is the last day participants may join or merge teams.
+March 25, 2026 - Competition End Date & Final Submission Deadline.
+Week of March 30, 2026 - Private leaderboard release.
+All deadlines are at 11:59 PM UTC on the corresponding day unless otherwise noted. The competition organizers reserve the right to update the contest timeline if they deem it necessary.
+
+Prizes
+Code Requirements
+
+
+This is a Code Competition
+Submissions to this competition must be made through Notebooks. In order for the "Submit" button to be active after a commit, the following conditions must be met:
+
+CPU Notebook <= 8 hours run-time
+GPU Notebook <= 8 hours run-time
+Internet access disabled
+Freely & publicly available external data is allowed, including pre-trained models
+Submission file must be named submission.csv
+Submission runtimes have been slightly obfuscated. If you repeat the exact same submission you will see up to 5 minutes of variance in the time before you receive your score.
+Future Data Evaluation Phase
+The run-time limits for both CPU and GPU notebooks will be extended to during the future data evaluation period proportional to the number of future samples. You must ensure your submission completes within that time. The extra runtime will enable us to use a substantially larger test set as the basis for ranking submissions on the final private leaderboard.
+
+Please see the Code Competition FAQ for more information on how to submit. And review the code debugging doc if you are encountering submission errors.
+
+Additional Resources
+What's the state-of-the-art in RNA 3D structure prediction?
+
+2024 CASP16 challenge – 2025 paper from assessors
+
+Part 1 of the Stanford RNA 3D Folding challenge
+
+Outcome of Part 1, Kaggle Post
+
+"Template-based RNA structure prediction advanced through a blind code competition", Preprint summarizing Part 1
+
+How to think about RNA structure
+
+A perspective from domain experts
+
+Citation
+Rhiju Das, Youhan Lee, Chris Munley, Przemek Porebski, Walter Reade, Theo Viel, and Ashley Oldacre. Stanford RNA 3D Folding Part 2. https://kaggle.com/competitions/stanford-rna-3d-folding-2, 2026. Kaggle.
